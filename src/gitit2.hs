@@ -1,15 +1,24 @@
 {-# LANGUAGE QuasiQuotes, TemplateHaskell, MultiParamTypeClasses, TypeFamilies,
-    OverloadedStrings #-}
+    OverloadedStrings, DeriveDataTypeable, FlexibleContexts, GADTs #-}
+import Prelude hiding (mapM)
 import Network.Gitit2
 import Network.Socket hiding (Debug)
 import Yesod
+import Yesod.Auth
+import Yesod.Auth.Email
 import Yesod.Static
+import Database.Persist.Sql (runMigration, SqlPersistT)
+import Database.Persist.Sqlite (SqliteConf (SqliteConf))
 import Network.Wai.Handler.Warp
+import Data.Maybe (isJust)
 import Data.FileStore
 import Data.Yaml
 import Control.Applicative
+import Control.Monad (join)
+import Control.Monad.Logger (runNoLoggingT)
 import Text.Pandoc
 import qualified Text.Pandoc.UTF8 as UTF8
+import Text.Email.Validate (canonicalizeEmail)
 import System.FilePath ((<.>), (</>))
 import Control.Monad (when, unless)
 import System.Directory (removeDirectoryRecursive, doesDirectoryExist)
@@ -19,6 +28,7 @@ import System.IO
 import System.Exit
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.Encoding as T
 import Prelude hiding (catch)
 import Control.Exception (catch, SomeException)
 import qualified Data.Set as Set
@@ -26,8 +36,17 @@ import Paths_gitit2 (getDataFileName)
 -- TODO only for samplePlugin
 import Data.Generics
 
-data Master = Master { getGitit :: Gitit, maxUploadSize :: Int, getStatic :: Static }
+type PersistConf = SqliteConf
+
+data Master = Master { getGitit      :: Gitit
+                     , getStatic     :: Static
+                     , maxUploadSize :: Int
+                     , persistConfig :: PersistConf
+                     , connPool      :: PersistConfigPool PersistConf
+                     }
+
 mkYesod "Master" [parseRoutes|
+/auth AuthR Auth getAuth
 /static StaticR Static getStatic
 /wiki SubsiteR Gitit getGitit
 / RootR GET
@@ -35,6 +54,21 @@ mkYesod "Master" [parseRoutes|
 
 getRootR :: Handler ()
 getRootR = redirect $ SubsiteR HomeR
+
+share [mkPersist sqlSettings, mkMigrate "migrateAll"] [persistLowerCase|
+User
+    ident Text
+    email Text
+    password Text Maybe
+    verkey Text Maybe
+    verified Bool
+    UniqueUser ident
+    UniqueEmail email
+    deriving Typeable
+|]
+
+userGititUser :: User -> GititUser
+userGititUser (User ident email _ _ _) = GititUser (T.unpack ident) (T.unpack email)
 
 instance Yesod Master where
   defaultLayout contents = do
@@ -52,7 +86,68 @@ instance Yesod Master where
                <p.message>#{msg}
              ^{bodyTags}
         |]
+  authRoute _ = Just $ AuthR LoginR
   maximumContentLength x _ = Just $ fromIntegral $ maxUploadSize x
+
+instance YesodPersist Master where
+  type YesodPersistBackend Master = SqlPersistT
+  runDB = defaultRunDB persistConfig connPool
+
+instance YesodAuth Master where
+  type AuthId Master = UserId
+
+  loginDest _ = RootR
+
+  logoutDest _ = RootR
+
+  getAuthId (Creds plugin ident _) | plugin == "username" =
+    runDB (getBy $ UniqueUser ident) >>= return . fmap entityKey
+  getAuthId (Creds plugin ident _) | T.isPrefixOf "email" plugin =
+    runDB (getBy $ UniqueEmail ident) >>= return . fmap entityKey
+  getAuthId (Creds _ _ _) | otherwise = return Nothing
+
+  authPlugins _ = [authEmail]
+
+  authHttpManager = error "authHttpManager"
+
+instance YesodAuthEmail Master where
+    type AuthEmailId Master = UserId
+
+    addUnverified em vk = do
+        login <- makeLogin em
+        runDB $ insert $ User login em Nothing (Just vk) False
+        where
+            makeLogin = return . T.takeWhile (/= '@')
+
+    sendVerifyEmail _ _ verurl = redirect verurl
+
+    getVerifyKey emid = runDB (get emid) >>= return . join . fmap userVerkey
+
+    setVerifyKey emid vk = runDB $ update emid [UserVerkey =. Just vk]
+
+    verifyAccount emid = runDB (get emid) >>= return . fmap (const emid)
+
+    getPassword uid = runDB $ userPassword <$> get404 uid
+
+    setPassword uid pass = runDB $ update uid [UserPassword =. Just pass]
+
+    getEmailCreds ident = do
+        ment <- runDB $ getByEither $ wrap ident
+        return $ userEmailCreds <$> ment
+        where
+            getByEither (Left ident') = getBy $ UniqueUser ident'
+            getByEither (Right email) = getBy $ UniqueEmail email
+
+            isValidEmail = isJust . canonicalizeEmail . T.encodeUtf8
+
+            wrap s | isValidEmail s = Right s
+            wrap s | otherwise = Left s
+
+            userEmailCreds (Entity k (User _ em _ vk vst)) = EmailCreds k (Just k) vst vk em
+
+    getEmail emid = runDB (get emid) >>= return . fmap userEmail
+
+    afterPasswordRoute _ = RootR
 
 instance RenderMessage Master FormMessage where
     renderMessage _ _ = defaultFormMessage
@@ -61,10 +156,15 @@ instance RenderMessage Master GititMessage where
     renderMessage x = renderMessage (getGitit x)
 
 instance HasGitit Master where
-  maybeUser = return $ Just $ GititUser "Dummy" "dumb@dumber.org"
-  requireUser = return $ GititUser "Dummy" "dumb@dumber.org"
+
+  maybeUser = lift $ maybeAuth >>= return . fmap (userGititUser . entityVal)
+
+  requireUser = lift $ requireAuth >>= return . userGititUser . entityVal
+
   makePage = makeDefaultPage
+
   getPlugins = return [] -- [samplePlugin]
+
   staticR = StaticR
 
 -- | Ready collection of common mime types. (Copied from
@@ -109,6 +209,7 @@ data Conf = Conf { cfg_port             :: Int
                  , cfg_help_page        :: Text
                  , cfg_max_upload_size  :: String
                  , cfg_latex_engine     :: Maybe FilePath
+                 , cfg_sqlite_file      :: FilePath
                  }
 
 -- | Read a file associating mime types with extensions, and return a
@@ -146,6 +247,7 @@ parseConfig o = Conf
   <*> o .:? "help_page" .!= "Help"
   <*> o .:? "max_upload_size" .!= "1M"
   <*> o .:? "latex_engine"
+  <*> o .:? "sqlite_file" .!= "gitit-users.sqlite3"
 
 readNumber :: String -> Maybe Int
 readNumber x = case reads x of
@@ -241,13 +343,19 @@ main = do
 
   unless repoexists $ initializeRepo gconfig fs
 
+  let dbconf = SqliteConf (T.pack $ cfg_sqlite_file conf) 1
+  poolconf <- createPoolConfig dbconf
+  runNoLoggingT $ runPool dbconf (runMigration migrateAll) poolconf
   let runner = runSettingsSocket settings sock
   runner =<< toWaiApp
       (Master (Gitit{ config = gconfig
                     , filestore = fs
                     })
+              st
               maxsize
-              st)
+              dbconf
+              poolconf
+      )
 
 initializeRepo :: GititConfig -> FileStore -> IO ()
 initializeRepo gconfig fs = do
